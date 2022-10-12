@@ -77,6 +77,7 @@ class PySCFDriver(ElectronicStructureDriver):
         charge: int = 0,
         spin: int = 0,
         basis: str = "sto3g",
+        lo_basis: Optional[str] = None,
         method: MethodType = MethodType.RHF,
         xc_functional: str = "lda,vwn",
         xcf_library: str = "libxc",
@@ -157,6 +158,7 @@ class PySCFDriver(ElectronicStructureDriver):
         self._charge = charge
         self._spin = spin
         self._basis = basis
+        self._lo_basis = lo_basis
         self._method = method
         self._xc_functional = xc_functional
         self.xcf_library = xcf_library  # validate choice in property setter
@@ -220,6 +222,16 @@ class PySCFDriver(ElectronicStructureDriver):
     def basis(self, value: str) -> None:
         """set basis"""
         self._basis = value
+
+    @property
+    def lo_basis(self) -> str:
+        """return localized basis"""
+        return self._lo_basis
+
+    @basis.setter
+    def lo_basis(self, value: str) -> None:
+        """set localized basis"""
+        self._lo_basis = value
 
     @property
     def method(self) -> MethodType:
@@ -550,6 +562,7 @@ class PySCFDriver(ElectronicStructureDriver):
             f"charge={self._charge}",
             f"spin={self._spin}",
             f"basis={self._basis}",
+            f"lo_basis={self._lo_basis}",
             f"method={self.method.value}",
             f"conv_tol={self._conv_tol}",
             f"max_cycle={self._max_cycle}",
@@ -567,6 +580,36 @@ class PySCFDriver(ElectronicStructureDriver):
 
         driver_result.add_property(DriverMetadata("PYSCF", pyscf_version, "\n".join(cfg + [""])))
 
+    def to_localized_basis(self, lo_orb_type: str):
+        from pyscf import lo, ao2mo
+        from functools import reduce
+
+        if lo_orb_type == "NAO":
+            # C matrix stores the AO to localized orbital coefficients
+            C = lo.orth_ao(self._calc, "nao")
+
+            # C is orthogonal wrt to the AO overlap matrix.  C^T S C  is an identity matrix
+            print(
+                abs(
+                    reduce(np.dot, (C.T, self._calc.get_ovlp(), C)) - np.eye(self._mol.nao_nr())
+                ).max()
+            )  # should be close to 0
+
+            # The following linear equation can also be solved using the matrix
+            # multiplication reduce(numpy.dot (C.T, mf.get_ovlp(), mf.mo_coeff))
+            _nao = np.linalg.solve(C, self._calc.mo_coeff)
+            return _nao
+        elif lo_orb_type == "IAO":
+            _iao = lo.iao.iao(self._mol, self._calc.mo_coeff)
+            _iao = lo.vec_lowdin(_iao, self._calc.get_ovlp())
+            return _iao
+        elif lo_orb_type == "IBO":
+            _iao = self.to_localized_basis("IAO")
+            _ibo = lo.ibo.ibo(self._mol, self._calc.mo_coeff, iaos=_iao)
+            return _ibo
+        else:
+            raise QiskitNatureError("Failed to build the PySCF localized basis")
+
     def _populate_driver_result_basis_transform(
         self, driver_result: ElectronicStructureDriverResult
     ) -> None:
@@ -574,6 +617,9 @@ class PySCFDriver(ElectronicStructureDriver):
         from pyscf.tools import dump_mat
 
         mo_coeff, mo_coeff_b = self._extract_mo_data("mo_coeff", array_dimension=3)
+
+        if self._lo_basis is not None:
+            mo_coeff = self.to_localized_basis(self._lo_basis)
 
         if logger.isEnabledFor(logging.DEBUG):
             # Add some more to PySCF output...
